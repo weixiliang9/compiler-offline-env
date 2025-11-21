@@ -1,0 +1,446 @@
+name: Full Package Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      build_modules:
+        description: 'Modules to build'
+        type: choice
+        options:
+        - all
+        - base
+        - python-js
+        - android
+        default: 'all'
+
+env:
+  UBUNTU_VERSION: "20.04"
+  DOCKER_IMAGE: "ubuntu:20.04"
+
+jobs:
+  build-base:
+    if: ${{ github.event.inputs.build_modules == 'all' || github.event.inputs.build_modules == 'base' }}
+    runs-on: ubuntu-latest
+    outputs:
+      base_size: ${{ steps.package.outputs.package_size }}
+      base_checksum: ${{ steps.package.outputs.package_checksum }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Build base environment packages
+        run: |
+          mkdir -p artifacts/base-packages
+          
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y xargs apt-utils
+            
+            cd artifacts/base-packages
+            
+            # 下载基础环境所有包
+            xargs -a /workspace/packages/base-packages.list apt-get download
+            
+            # 递归下载所有依赖
+            for pkg in \$(cat /workspace/packages/base-packages.list); do
+              echo \"处理包: \$pkg\"
+              apt-cache depends --recurse --no-recommends --no-suggests \
+                --no-conflicts --no-breaks --no-replaces --no-enhances \
+                \"\$pkg\" | grep \"^\w\" | xargs -r apt-get download || true
+            done
+            "
+            
+      - name: Generate base package metadata
+        run: |
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace/artifacts/base-packages \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y dpkg-dev jq
+            
+            # 生成包索引
+            dpkg-scanpackages . /dev/null > Packages
+            gzip -k Packages
+            
+            # 生成版本清单
+            echo '[' > versions.json
+            first=true
+            for deb in *.deb; do
+              if [ -f \"\$deb\" ]; then
+                pkg_name=\$(dpkg-deb -f \"\$deb\" Package)
+                pkg_version=\$(dpkg-deb -f \"\$deb\" Version)
+                
+                if [ \"\$first\" = \"true\" ]; then
+                  first=false
+                else
+                  echo ',' >> versions.json
+                fi
+                echo -n \"{\\\"name\\\": \\\"\$pkg_name\\\", \\\"version\\\": \\\"\$pkg_version\\\"}\" >> versions.json
+              fi
+            done
+            echo ']' >> versions.json
+            "
+            
+      - name: Create base repository config
+        run: |
+          cd artifacts/base-packages
+          cat > Release << EOF
+          Origin: Local Base Repository
+          Label: Local Base Repository
+          Suite: focal
+          Codename: focal
+          Version: 20.04
+          Architectures: amd64
+          Components: main
+          Description: Local offline base package repository for Ubuntu 20.04
+          Date: $(date -Ru)
+          EOF
+          
+      - name: Package base environment
+        id: package
+        run: |
+          cd artifacts
+          tar -czf base-${{ github.event.inputs.release_tag }}.tar.gz base-packages/
+          BASE_SIZE=$(du -h base-${{ github.event.inputs.release_tag }}.tar.gz | cut -f1)
+          BASE_CHECKSUM=$(sha256sum base-${{ github.event.inputs.release_tag }}.tar.gz | cut -d' ' -f1)
+          
+          echo "$BASE_CHECKSUM" > base-${{ github.event.inputs.release_tag }}.sha256
+          
+          echo "package_size=$BASE_SIZE" >> $GITHUB_OUTPUT
+          echo "package_checksum=$BASE_CHECKSUM" >> $GITHUB_OUTPUT
+          
+      - name: Upload base artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-packages-${{ github.event.inputs.release_tag }}
+          path: |
+            artifacts/base-${{ github.event.inputs.release_tag }}.tar.gz
+            artifacts/base-${{ github.event.inputs.release_tag }}.sha256
+          retention-days: 1
+
+  build-python-js:
+    if: ${{ github.event.inputs.build_modules == 'all' || github.event.inputs.build_modules == 'python-js' }}
+    runs-on: ubuntu-latest
+    outputs:
+      python_js_size: ${{ steps.package.outputs.package_size }}
+      python_js_checksum: ${{ steps.package.outputs.package_checksum }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Build Python/JS environment packages
+        run: |
+          mkdir -p artifacts/python-js-packages
+          
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y xargs apt-utils python3-pip npm
+            
+            cd artifacts/python-js-packages
+            
+            # 下载系统包
+            xargs -a /workspace/packages/python-js-packages.list apt-get download
+            
+            # 下载依赖
+            for pkg in \$(cat /workspace/packages/python-js-packages.list); do
+              apt-cache depends --recurse --no-recommends \"\$pkg\" | \
+                grep \"^\w\" | xargs -r apt-get download || true
+            done
+            
+            # 下载 Python wheels
+            pip3 download numpy pandas django flask requests --no-deps --platform manylinux2014_x86_64 || true
+            "
+            
+      - name: Generate Python/JS package metadata
+        run: |
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace/artifacts/python-js-packages \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y dpkg-dev jq
+            
+            # 只处理 .deb 文件
+            find . -name '*.deb' | dpkg-scanpackages . /dev/null > Packages
+            gzip -k Packages
+            
+            # 生成版本清单
+            echo '[' > versions.json
+            first=true
+            for deb in *.deb; do
+              if [ -f \"\$deb\" ]; then
+                pkg_name=\$(dpkg-deb -f \"\$deb\" Package)
+                pkg_version=\$(dpkg-deb -f \"\$deb\" Version)
+                
+                if [ \"\$first\" = \"true\" ]; then
+                  first=false
+                else
+                  echo ',' >> versions.json
+                fi
+                echo -n \"{\\\"name\\\": \\\"\$pkg_name\\\", \\\"version\\\": \\\"\$pkg_version\\\"}\" >> versions.json
+              fi
+            done
+            echo ']' >> versions.json
+            "
+            
+      - name: Package Python/JS environment
+        id: package
+        run: |
+          cd artifacts
+          tar -czf python-js-${{ github.event.inputs.release_tag }}.tar.gz python-js-packages/
+          PYTHON_JS_SIZE=$(du -h python-js-${{ github.event.inputs.release_tag }}.tar.gz | cut -f1)
+          PYTHON_JS_CHECKSUM=$(sha256sum python-js-${{ github.event.inputs.release_tag }}.tar.gz | cut -d' ' -f1)
+          
+          echo "$PYTHON_JS_CHECKSUM" > python-js-${{ github.event.inputs.release_tag }}.sha256
+          
+          echo "package_size=$PYTHON_JS_SIZE" >> $GITHUB_OUTPUT
+          echo "package_checksum=$PYTHON_JS_CHECKSUM" >> $GITHUB_OUTPUT
+          
+      - name: Upload Python/JS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-js-packages-${{ github.event.inputs.release_tag }}
+          path: |
+            artifacts/python-js-${{ github.event.inputs.release_tag }}.tar.gz
+            artifacts/python-js-${{ github.event.inputs.release_tag }}.sha256
+          retention-days: 1
+
+  build-android:
+    if: ${{ github.event.inputs.build_modules == 'all' || github.event.inputs.build_modules == 'android' }}
+    runs-on: ubuntu-latest
+    outputs:
+      android_size: ${{ steps.package.outputs.package_size }}
+      android_checksum: ${{ steps.package.outputs.package_checksum }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Build Android environment packages
+        run: |
+          mkdir -p artifacts/android-packages
+          
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y xargs apt-utils wget unzip
+            
+            cd artifacts/android-packages
+            
+            # 下载系统包
+            xargs -a /workspace/packages/android-packages.list apt-get download
+            
+            # 下载依赖
+            for pkg in \$(cat /workspace/packages/android-packages.list); do
+              apt-cache depends --recurse --no-recommends \"\$pkg\" | \
+                grep \"^\w\" | xargs -r apt-get download || true
+            done
+            
+            # 下载 Android 工具
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+            wget -q https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+            "
+            
+      - name: Generate Android package metadata
+        run: |
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace/artifacts/android-packages \
+            $DOCKER_IMAGE \
+            bash -c "
+            apt-get update
+            apt-get install -y dpkg-dev jq
+            
+            # 只处理 .deb 文件
+            find . -name '*.deb' | dpkg-scanpackages . /dev/null > Packages
+            gzip -k Packages
+            
+            # 生成版本清单
+            echo '[' > versions.json
+            first=true
+            for deb in *.deb; do
+              if [ -f \"\$deb\" ]; then
+                pkg_name=\$(dpkg-deb -f \"\$deb\" Package)
+                pkg_version=\$(dpkg-deb -f \"\$deb\" Version)
+                
+                if [ \"\$first\" = \"true\" ]; then
+                  first=false
+                else
+                  echo ',' >> versions.json
+                fi
+                echo -n \"{\\\"name\\\": \\\"\$pkg_name\\\", \\\"version\\\": \\\"\$pkg_version\\\"}\" >> versions.json
+              fi
+            done
+            echo ']' >> versions.json
+            "
+            
+      - name: Package Android environment
+        id: package
+        run: |
+          cd artifacts
+          tar -czf android-${{ github.event.inputs.release_tag }}.tar.gz android-packages/
+          ANDROID_SIZE=$(du -h android-${{ github.event.inputs.release_tag }}.tar.gz | cut -f1)
+          ANDROID_CHECKSUM=$(sha256sum android-${{ github.event.inputs.release_tag }}.tar.gz | cut -d' ' -f1)
+          
+          echo "$ANDROID_CHECKSUM" > android-${{ github.event.inputs.release_tag }}.sha256
+          
+          echo "package_size=$ANDROID_SIZE" >> $GITHUB_OUTPUT
+          echo "package_checksum=$ANDROID_CHECKSUM" >> $GITHUB_OUTPUT
+          
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-packages-${{ github.event.inputs.release_tag }}
+          path: |
+            artifacts/android-${{ github.event.inputs.release_tag }}.tar.gz
+            artifacts/android-${{ github.event.inputs.release_tag }}.sha256
+          retention-days: 1
+
+  create-full-release:
+    needs: [build-base, build-python-js, build-android]
+    runs-on: ubuntu-latest
+    # 即使某些模块构建失败，也创建发布（包含成功的模块）
+    if: always()
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: *-${{ github.event.inputs.release_tag }}
+          merge-multiple: true
+          
+      - name: Create release manifest
+        run: |
+          TIMESTAMP=$(date -Iseconds)
+          cat > release-artifacts/release-manifest.json << EOF
+          {
+            "release_tag": "${{ github.event.inputs.release_tag }}",
+            "build_date": "$TIMESTAMP",
+            "ubuntu_version": "$UBUNTU_VERSION",
+            "modules": {
+              "base": {
+                "built": ${{ needs.build-base.result == 'success' }},
+                "size": "${{ needs.build-base.outputs.base_size }}",
+                "checksum": "${{ needs.build-base.outputs.base_checksum }}"
+              },
+              "python_js": {
+                "built": ${{ needs.build-python-js.result == 'success' }},
+                "size": "${{ needs.build-python-js.outputs.python_js_size }}",
+                "checksum": "${{ needs.build-python-js.outputs.python_js_checksum }}"
+              },
+              "android": {
+                "built": ${{ needs.build-android.result == 'success' }},
+                "size": "${{ needs.build-android.outputs.android_size }}",
+                "checksum": "${{ needs.build-android.outputs.android_checksum }}"
+              }
+            },
+            "workflow_run": {
+              "id": ${{ github.run_id }},
+              "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "Full Offline Packages ${{ github.event.inputs.release_tag }}"
+          body: |
+            ## 全量离线环境包发布 ${{ github.event.inputs.release_tag }}
+            
+            ### 构建状态
+            | 环境模块 | 状态 | 压缩包大小 | 校验和 |
+            |----------|------|------------|--------|
+            | 基础编译环境 | ${{ needs.build-base.result }} | ${{ needs.build-base.outputs.base_size }} | `${{ needs.build-base.outputs.base_checksum }}` |
+            | Python/JS 环境 | ${{ needs.build-python-js.result }} | ${{ needs.build-python-js.outputs.python_js_size }} | `${{ needs.build-python-js.outputs.python_js_checksum }}` |
+            | Android 环境 | ${{ needs.build-android.result }} | ${{ needs.build-android.outputs.android_size }} | `${{ needs.build-android.outputs.android_checksum }}` |
+            
+            ### 使用说明
+            
+            每个环境模块都是独立的，可以根据需要下载：
+            
+            **基础编译环境** (`base-${{ github.event.inputs.release_tag }}.tar.gz`)
+            - 包含 GCC、Clang、CMake、Make 等基础编译工具
+            - 系统开发库和头文件
+            - 网络和文件系统工具
+            
+            **Python/JS 开发环境** (`python-js-${{ github.event.inputs.release_tag }}.tar.gz`)
+            - Python 3.8 和 pip 环境
+            - Node.js 和 npm
+            - 常用 Python 数据科学和 Web 开发包
+            
+            **Android 开发环境** (`android-${{ github.event.inputs.release_tag }}.tar.gz`)
+            - OpenJDK 8/11/13
+            - Android SDK 命令行工具
+            - Android NDK
+            - 32位库支持
+            
+            ### 部署步骤
+            
+            1. 下载需要的环境模块
+            2. 使用对应的部署脚本进行安装
+            3. 运行 `sudo apt-get update` 更新包索引
+            
+            ### 文件校验
+            
+            下载后请使用对应的 `.sha256` 文件校验完整性：
+            ```bash
+            sha256sum -c base-${{ github.event.inputs.release_tag }}.sha256
+            ```
+            
+            **构建信息**
+            - Ubuntu 版本: ${{ env.UBUNTU_VERSION }}
+            - 构建时间: $TIMESTAMP
+            - 工作流运行: [#${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.sha256
+            release-artifacts/release-manifest.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Update version manifests in repository
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          # 下载构建的版本清单并更新到仓库
+          mkdir -p packages/versions
+          
+          if [ -f "artifacts/base-packages/versions.json" ]; then
+            cp artifacts/base-packages/versions.json packages/versions/base-versions.json
+          fi
+          if [ -f "artifacts/python-js-packages/versions.json" ]; then
+            cp artifacts/python-js-packages/versions.json packages/versions/python-js-versions.json
+          fi
+          if [ -f "artifacts/android-packages/versions.json" ]; then
+            cp artifacts/android-packages/versions.json packages/versions/android-versions.json
+          fi
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add packages/versions/
+          git commit -m "Update version manifests for release ${{ github.event.inputs.release_tag }}" || echo "No changes to commit"
+          git push
