@@ -1,0 +1,52 @@
+# Java 环境
+openjdk-8-jdk
+openjdk-11-jdk
+openjdk-13-jdk
+default-jdk
+
+# Android 编译依赖
+libwxgtk3.0-gtk3-dev
+libesd0-dev
+squashfs-tools
+pngcrush
+schedtool
+libx11-dev
+libgl1-mesa-dev
+libxml2-utils
+liblz4-tool
+libncurses5
+libncurses5-dev
+m4
+libz-dev
+perl
+python2.7
+python2.7-dev
+
+# 32位库支持
+lib32readline-dev
+lib32z-dev
+libc6-dev-i386
+lib32gcc1
+lib32gcc-s1
+lib32stdc++6
+lib32stdc++-9-dev
+lib32stdc++-10-dev
+
+# Android 构建工具
+genext2fs
+e2fsprogs
+android-tools-fsutils
+android-sdk-platform-tools-common
+
+# 内核编译工具
+libelf-dev
+libdwarf-dev
+dwarves
+bc
+libssl-dev
+libssl1.1
+
+# 设备工具
+usbutils
+android-tools-adb
+android-tools-fastboot
