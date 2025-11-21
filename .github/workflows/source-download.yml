@@ -1,0 +1,129 @@
+name: Source Code Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'Repository URL to download'
+        required: true
+      branch:
+        description: 'Branch to download'
+        default: 'main'
+      tag:
+        description: 'Specific tag to download'
+        required: false
+      release_name:
+        description: 'Release name for the source archive'
+        required: true
+      description:
+        description: 'Source description'
+        required: false
+        default: ''
+
+jobs:
+  download-source:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download source code
+        run: |
+          mkdir -p source-artifacts
+          cd source-artifacts
+          
+          REPO_URL="${{ github.event.inputs.repository_url }}"
+          REPO_NAME=$(basename "$REPO_URL" .git)
+          ARCHIVE_NAME="$REPO_NAME-source"
+          
+          echo "正在下载仓库: $REPO_URL"
+          
+          # 克隆仓库
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "下载标签: ${{ github.event.inputs.tag }}"
+            git clone --depth 1 --branch "${{ github.event.inputs.tag }}" "$REPO_URL" "$REPO_NAME"
+          else
+            echo "下载分支: ${{ github.event.inputs.branch }}"
+            git clone --depth 1 --branch "${{ github.event.inputs.branch }}" "$REPO_URL" "$REPO_NAME"
+          fi
+          
+          # 获取提交信息
+          cd "$REPO_NAME"
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -1)
+          cd ..
+          
+          # 创建源码包
+          tar -czf "$ARCHIVE_NAME.tar.gz" "$REPO_NAME/"
+          rm -rf "$REPO_NAME"
+          
+          # 生成校验和
+          sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.sha256"
+          
+          # 创建源码元数据
+          cat > source-metadata.json << EOF
+          {
+            "source_info": {
+              "repository": "$REPO_URL",
+              "branch": "${{ github.event.inputs.branch }}",
+              "tag": "${{ github.event.inputs.tag }}",
+              "commit_hash": "$COMMIT_HASH",
+              "commit_date": "$COMMIT_DATE",
+              "commit_message": "$COMMIT_MESSAGE",
+              "download_date": "$(date -Iseconds)",
+              "archive_name": "$ARCHIVE_NAME.tar.gz"
+            },
+            "workflow_run": {
+              "id": ${{ github.run_id }},
+              "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          
+      - name: Create source release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "source-${{ github.event.inputs.release_name }}"
+          name: "Source Code - ${{ github.event.inputs.release_name }}"
+          body: |
+            ## 源码归档 ${{ github.event.inputs.release_name }}
+            
+            ### 源码信息
+            | 项目 | 详情 |
+            |------|------|
+            | **仓库** | ${{ github.event.inputs.repository_url }} |
+            | **分支** | ${{ github.event.inputs.branch }} |
+            | **标签** | ${{ github.event.inputs.tag }} |
+            | **提交哈希** | `$COMMIT_HASH` |
+            | **提交日期** | $COMMIT_DATE |
+            | **提交信息** | $COMMIT_MESSAGE |
+            | **描述** | ${{ github.event.inputs.description }} |
+            
+            ### 下载信息
+            - 归档文件: `$ARCHIVE_NAME.tar.gz`
+            - 下载时间: $(date -Iseconds)
+            - 文件大小: $(du -h source-artifacts/$ARCHIVE_NAME.tar.gz | cut -f1)
+            - 校验和: `$(cat source-artifacts/$ARCHIVE_NAME.sha256 | cut -d' ' -f1)`
+            
+            ### 使用说明
+            
+            此归档包含指定版本的源码，可用于离线编译环境。
+            
+            解压后使用：
+            ```bash
+            tar -xzf $ARCHIVE_NAME.tar.gz
+            cd $REPO_NAME
+            ```
+            
+            ### 构建信息
+            - 工作流运行: [#${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          files: |
+            source-artifacts/*.tar.gz
+            source-artifacts/*.sha256
+            source-artifacts/source-metadata.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
