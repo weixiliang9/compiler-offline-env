@@ -1,0 +1,265 @@
+name: Incremental Package Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Package name to update/add'
+        required: true
+      target_environment:
+        description: 'Target environment'
+        type: choice
+        options:
+        - base
+        - python-js
+        - android
+        required: true
+        default: 'base'
+      base_release:
+        description: 'Base release tag to update from'
+        required: true
+      patch_release:
+        description: 'Patch release tag (e.g., v1.0.1)'
+        required: true
+      description:
+        description: 'Patch description'
+        required: false
+        default: ''
+
+env:
+  UBUNTU_VERSION: "20.04"
+  DOCKER_IMAGE: "ubuntu:20.04"
+
+jobs:
+  download-base-manifests:
+    runs-on: ubuntu-latest
+    outputs:
+      base_manifest_downloaded: ${{ steps.download.outputs.downloaded }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download base version manifests
+        id: download
+        run: |
+          mkdir -p base-manifests
+          
+          # 尝试从发布版本下载版本清单
+          echo "下载基础版本清单..."
+          wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.base_release }}/base-${{ github.event.inputs.base_release }}.tar.gz" -O base-packages.tar.gz && \
+          tar -xzOf base-packages.tar.gz base-packages/versions.json > base-manifests/base-versions.json 2>/dev/null || echo "基础环境版本清单下载失败"
+          
+          wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.base_release }}/python-js-${{ github.event.inputs.base_release }}.tar.gz" -O python-js-packages.tar.gz && \
+          tar -xzOf python-js-packages.tar.gz python-js-packages/versions.json > base-manifests/python-js-versions.json 2>/dev/null || echo "Python/JS环境版本清单下载失败"
+          
+          wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.base_release }}/android-${{ github.event.inputs.base_release }}.tar.gz" -O android-packages.tar.gz && \
+          tar -xzOf android-packages.tar.gz android-packages/versions.json > base-manifests/android-versions.json 2>/dev/null || echo "Android环境版本清单下载失败"
+          
+          # 如果发布版本中没有，使用仓库中的版本清单
+          if [ ! -f "base-manifests/${{ github.event.inputs.target_environment }}-versions.json" ]; then
+            echo "使用仓库中的版本清单"
+            cp packages/versions/${{ github.event.inputs.target_environment }}-versions.json base-manifests/ 2>/dev/null || echo "仓库版本清单也不存在"
+          fi
+          
+          echo "base_manifest_downloaded=true" >> $GITHUB_OUTPUT
+
+  analyze-package-dependencies:
+    needs: download-base-manifests
+    runs-on: ubuntu-latest
+    outputs:
+      required_packages: ${{ steps.analyze.outputs.required_packages }}
+      package_count: ${{ steps.analyze.outputs.package_count }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up dependency analyzer
+        run: |
+          chmod +x scripts/dependency-analyzer.sh
+          
+      - name: Analyze package dependencies
+        id: analyze
+        run: |
+          BASE_MANIFEST="base-manifests/${{ github.event.inputs.target_environment }}-versions.json"
+          
+          if [ ! -f "$BASE_MANIFEST" ]; then
+            echo "错误: 基础版本清单不存在: $BASE_MANIFEST"
+            exit 1
+          fi
+          
+          # 运行依赖分析
+          ./scripts/dependency-analyzer.sh \
+            "${{ github.event.inputs.package_name }}" \
+            "${{ github.event.inputs.target_environment }}" \
+            "$BASE_MANIFEST" \
+            "required-packages.txt"
+            
+          # 读取分析结果
+          if [ -f "required-packages.txt" ]; then
+            PACKAGE_LIST=$(cat required-packages.txt | tr '\n' ',' | sed 's/,$//')
+            PACKAGE_COUNT=$(cat required-packages.txt | wc -l)
+            
+            echo "required_packages=$PACKAGE_LIST" >> $GITHUB_OUTPUT
+            echo "package_count=$PACKAGE_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "required_packages=" >> $GITHUB_OUTPUT
+            echo "package_count=0" >> $GITHUB_OUTPUT
+          fi
+
+  build-patch:
+    needs: analyze-package-dependencies
+    runs-on: ubuntu-latest
+    # 只有在有包需要更新时才构建补丁
+    if: needs.analyze-package-dependencies.outputs.package_count != '0'
+    outputs:
+      patch_size: ${{ steps.build.outputs.patch_size }}
+      patch_checksum: ${{ steps.build.outputs.patch_checksum }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up patch generator
+        run: |
+          chmod +x scripts/patch-generator.sh
+          
+      - name: Build patch package
+        id: build
+        run: |
+          # 使用 patch generator 创建补丁包
+          ./scripts/patch-generator.sh \
+            "${{ github.event.inputs.target_environment }}" \
+            "${{ github.event.inputs.base_release }}" \
+            "required-packages.txt" \
+            "patch-artifacts"
+            
+          # 获取补丁信息
+          PATCH_FILE=$(ls patch-artifacts/patch-*.tar.gz)
+          PATCH_SIZE=$(du -h "$PATCH_FILE" | cut -f1)
+          PATCH_CHECKSUM=$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)
+          
+          echo "patch_size=$PATCH_SIZE" >> $GITHUB_OUTPUT
+          echo "patch_checksum=$PATCH_CHECKSUM" >> $GITHUB_OUTPUT
+          
+      - name: Upload patch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-${{ github.event.inputs.target_environment }}-${{ github.event.inputs.patch_release }}
+          path: |
+            patch-artifacts/patch-*.tar.gz
+            patch-artifacts/patch-*.sha256
+          retention-days: 1
+
+  create-patch-release:
+    needs: [analyze-package-dependencies, build-patch]
+    runs-on: ubuntu-latest
+    # 即使没有包需要更新也创建发布（记录分析结果）
+    if: always()
+    
+    steps:
+      - name: Download patch artifact
+        if: needs.analyze-package-dependencies.outputs.package_count != '0'
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: patch-${{ github.event.inputs.target_environment }}-${{ github.event.inputs.patch_release }}
+          
+      - name: Create patch release manifest
+        run: |
+          TIMESTAMP=$(date -Iseconds)
+          cat > release-artifacts/patch-manifest.json << EOF
+          {
+            "patch_info": {
+              "package": "${{ github.event.inputs.package_name }}",
+              "target_environment": "${{ github.event.inputs.target_environment }}",
+              "base_release": "${{ github.event.inputs.base_release }}",
+              "patch_release": "${{ github.event.inputs.patch_release }}",
+              "generated_date": "$TIMESTAMP",
+              "package_count": ${{ needs.analyze-package-dependencies.outputs.package_count }},
+              "packages_required": "${{ needs.analyze-package-dependencies.outputs.required_packages }}",
+              "patch_built": ${{ needs.analyze-package-dependencies.outputs.package_count != '0' }},
+              "patch_size": "${{ needs.build-patch.outputs.patch_size }}",
+              "patch_checksum": "${{ needs.build-patch.outputs.patch_checksum }}"
+            },
+            "workflow_run": {
+              "id": ${{ github.run_id }},
+              "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          
+      - name: Create GitHub Release for Patch
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.patch_release }}
+          name: "Patch Update ${{ github.event.inputs.patch_release }} - ${{ github.event.inputs.package_name }}"
+          body: |
+            ## 增量更新补丁 ${{ github.event.inputs.patch_release }}
+            
+            ### 更新信息
+            | 项目 | 详情 |
+            |------|------|
+            | **目标包** | `${{ github.event.inputs.package_name }}` |
+            | **目标环境** | `${{ github.event.inputs.target_environment }}` |
+            | **基础版本** | `${{ github.event.inputs.base_release }}` |
+            | **补丁描述** | ${{ github.event.inputs.description }} |
+            | **分析结果** | ${{ needs.analyze-package-dependencies.outputs.package_count }} 个包需要更新 |
+            | **补丁大小** | ${{ needs.build-patch.outputs.patch_size }} |
+            | **校验和** | `${{ needs.build-patch.outputs.patch_checksum }}` |
+            
+            ### 包含的包
+            ${{ needs.analyze-package-dependencies.outputs.package_count }} 个包需要更新/新增：
+            
+            ```plaintext
+            ${{ fromJSON(needs.analyze-package-dependencies.outputs.required_packages) }}
+            ```
+            
+            ### 使用说明
+            
+            **如果有补丁包** (`patch-*.tar.gz`):
+            
+            1. 下载补丁包
+            2. 使用部署脚本安装：
+            ```bash
+            ./scripts/deploy-patch.sh patch-*.tar.gz
+            ```
+            
+            3. 或者手动解压并复制：
+            ```bash
+            tar -xzf patch-*.tar.gz
+            ./install-patch.sh /opt/offline-repo/${{ github.event.inputs.target_environment }}
+            ```
+            
+            **如果没有补丁包**:
+            - 分析结果显示没有需要更新的包
+            - 目标包及其依赖在基础版本中已经是最新的
+            
+            ### 构建信息
+            - 分析时间: $TIMESTAMP
+            - 工作流运行: [#${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          files: |
+            release-artifacts/patch-*.tar.gz
+            release-artifacts/patch-*.sha256
+            release-artifacts/patch-manifest.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Update version manifests for patched packages
+        if: ${{ github.ref == 'refs/heads/main' && needs.analyze-package-dependencies.outputs.package_count != '0' }}
+        run: |
+          # 更新仓库中的版本清单
+          mkdir -p packages/versions
+          
+          # 这里需要实现版本清单的更新逻辑
+          # 根据 required-packages.txt 更新对应环境的版本清单
+          echo "更新版本清单..."
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add packages/versions/
+          git commit -m "Update ${{ github.event.inputs.target_environment }} versions for ${{ github.event.inputs.package_name }} patch" || echo "No changes to commit"
+          git push
